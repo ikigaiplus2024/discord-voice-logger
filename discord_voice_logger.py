@@ -2,7 +2,7 @@ import discord
 from discord.ext import commands
 import gspread
 from google.oauth2.service_account import Credentials
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import os
 import json
 
@@ -14,6 +14,9 @@ CREDENTIALS_JSON = os.environ.get('CREDENTIALS_JSON')
 # Google Sheets の設定
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
 SHEET_NAME = 'ボイスログ'
+
+# 日本時間（JST）のタイムゾーン設定
+JST = timezone(timedelta(hours=9))
 
 # Google Sheets 認証（環境変数から）
 def get_google_sheets_client():
@@ -79,6 +82,7 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 async def on_ready():
     print(f'✅ {bot.user} としてログインしました')
     print('👀 ボイスチャンネルの監視を開始します...')
+    print(f'🕐 現在の日本時間: {datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")}')
     
     # スプレッドシートの初期化
     initialize_sheet()
@@ -87,7 +91,8 @@ async def on_ready():
 async def on_voice_state_update(member, before, after):
     """ボイスチャンネルの入退室を検知"""
     
-    now = datetime.now()
+    # 日本時間を取得
+    now = datetime.now(JST)
     date = now.strftime('%Y-%m-%d')
     time_str = now.strftime('%H:%M:%S')
     
