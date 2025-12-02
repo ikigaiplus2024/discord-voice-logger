@@ -41,7 +41,7 @@ def initialize_sheet():
         # ヘッダー行を設定
         headers = ['日付', '名前', 'ID', '部屋の名前', '入室時間', '退出時間']
         if sheet.row_values(1) != headers:
-            sheet.update('A1:F1', [headers])
+sheet.update([headers], 'A1:F1')
         
         print("✅ スプレッドシート初期化完了")
         return sheet
