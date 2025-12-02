@@ -52,7 +52,7 @@ def initialize_sheet():
         print(f"❌ スプレッドシート初期化エラー: {e}")
         return None
 
-# ログをスプレッドシートに追加
+# ログをスプレッドシートに追加（入室時のみ使用）
 def log_to_sheet(date, name, user_id, channel_name, join_time, leave_time=""):
     try:
         client = get_google_sheets_client()
@@ -62,10 +62,39 @@ def log_to_sheet(date, name, user_id, channel_name, join_time, leave_time=""):
         # 新しい行を追加
         row = [date, name, str(user_id), channel_name, join_time, leave_time]
         sheet.append_row(row, value_input_option='USER_ENTERED')
-        print(f"📝 ログ記録完了: {name} - {channel_name}")
+        print(f"📝 入室記録: {name} - {channel_name} ({join_time})")
         
     except Exception as e:
         print(f"❌ スプレッドシート書き込みエラー: {e}")
+
+# 退出時間を既存の行に更新
+def update_leave_time(user_id, channel_name, leave_time):
+    try:
+        client = get_google_sheets_client()
+        spreadsheet = client.open_by_key(SPREADSHEET_ID)
+        sheet = spreadsheet.worksheet(SHEET_NAME)
+        
+        # 全データを取得
+        all_values = sheet.get_all_values()
+        
+        # 最後の行から遡って、該当ユーザーの入室記録を探す
+        for i in range(len(all_values) - 1, 0, -1):  # 最後の行から検索（0行目はヘッダー）
+            row = all_values[i]
+            # C列（index 2）がID、D列（index 3）が部屋名、F列（index 5）が退出時間
+            if len(row) >= 6:
+                # IDと部屋名が一致し、退出時間が空欄の行を探す
+                if row[2] == str(user_id) and row[3] == channel_name and (len(row) < 6 or row[5] == ""):
+                    # F列（6列目）に退出時間を更新
+                    sheet.update_cell(i + 1, 6, leave_time)
+                    print(f"📝 退出記録: {row[1]} - {channel_name} ({leave_time})")
+                    return True
+        
+        print(f"⚠️ 入室記録が見つかりません: UserID={user_id}, Channel={channel_name}")
+        return False
+        
+    except Exception as e:
+        print(f"❌ 退出時間更新エラー: {e}")
+        return False
 
 # 入室時間を記録する辞書
 user_join_times = {}
@@ -117,17 +146,13 @@ async def on_voice_state_update(member, before, after):
     # 退出検知
     elif before.channel is not None and after.channel is None:
         key = f"{member.id}_{before.channel.id}"
-        join_time = user_join_times.get(key, "不明")
         
         print(f"🔴 退出: {member.name} ← {before.channel.name} ({time_str})")
         
-        # スプレッドシートに退出時間を記録
-        log_to_sheet(
-            date=date,
-            name=member.name,
+        # 既存の行に退出時間を更新
+        update_leave_time(
             user_id=member.id,
             channel_name=before.channel.name,
-            join_time=join_time,
             leave_time=time_str
         )
         
@@ -139,17 +164,13 @@ async def on_voice_state_update(member, before, after):
     elif before.channel is not None and after.channel is not None and before.channel != after.channel:
         # 前のチャンネルから退出
         key_before = f"{member.id}_{before.channel.id}"
-        join_time_before = user_join_times.get(key_before, "不明")
         
         print(f"🔄 移動: {member.name} {before.channel.name} → {after.channel.name}")
         
-        # 前のチャンネルの退出を記録
-        log_to_sheet(
-            date=date,
-            name=member.name,
+        # 前のチャンネルの退出時間を更新
+        update_leave_time(
             user_id=member.id,
             channel_name=before.channel.name,
-            join_time=join_time_before,
             leave_time=time_str
         )
         
