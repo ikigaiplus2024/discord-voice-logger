@@ -109,25 +109,20 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 
 @bot.event
 async def on_ready():
-    """Bot起動時の処理(軽量化版)"""
+    """Bot起動時の処理"""
     print(f'✅ {bot.user} としてログインしました')
     print(f'🕐 現在の日本時間: {datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")}')
     print('👀 ボイスチャンネルの監視を開始します...')
     
     # スプレッドシート初期化を別スレッドで実行
-    if not sheet_init_task.is_running():
-        sheet_init_task.start()
-
-@tasks.loop(count=1)
-async def sheet_init_task():
-    """スプレッドシート初期化タスク(一度だけ実行)"""
-    await asyncio.sleep(2)  # Bot起動を待つ
     loop = asyncio.get_event_loop()
     success = await loop.run_in_executor(None, initialize_sheet_sync)
     if success:
         print("📊 スプレッドシートの記録準備完了")
-    else:
-        print("❌ スプレッドシート初期化に失敗しました")
+    
+    # 稼働確認ログを開始
+    if not keep_alive.is_running():
+        keep_alive.start()
 
 @bot.event
 async def on_voice_state_update(member, before, after):
@@ -201,10 +196,6 @@ async def on_voice_state_update(member, before, after):
 async def keep_alive():
     print(f"💓 稼働中... {datetime.now(JST).strftime('%H:%M:%S')}")
 
-@keep_alive.before_loop
-async def before_keep_alive():
-    await bot.wait_until_ready()
-
 # Bot を起動
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
@@ -212,9 +203,5 @@ if __name__ == "__main__":
     elif not SPREADSHEET_ID:
         print("❌ SPREADSHEET_ID が設定されていません")
     else:
-        try:
-            print("🚀 Bot を起動しています...")
-            keep_alive.start()  # 稼働確認ログを開始
-            bot.run(DISCORD_TOKEN)
-        except Exception as e:
-            print(f"❌ Bot起動エラー: {e}")
+        print("🚀 Bot を起動しています...")
+        bot.run(DISCORD_TOKEN)
