@@ -1,12 +1,11 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timezone, timedelta
 import os
 import json
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
 
 # 環境変数から設定を取得
 SPREADSHEET_ID = os.environ.get('SPREADSHEET_ID')
@@ -17,23 +16,29 @@ CREDENTIALS_JSON = os.environ.get('CREDENTIALS_JSON')
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
 SHEET_NAME = 'ボイスログ'
 
-# 日本時間（JST）のタイムゾーン設定
+# 日本時間(JST)のタイムゾーン設定
 JST = timezone(timedelta(hours=9))
 
-# スレッドプール
-executor = ThreadPoolExecutor(max_workers=3)
+# Google Sheets クライアント(グローバルで保持)
+sheets_client = None
+spreadsheet = None
+sheet = None
 
-# Google Sheets 認証（環境変数から）
+# Google Sheets 認証
 def get_google_sheets_client():
-    if CREDENTIALS_JSON:
-        creds_dict = json.loads(CREDENTIALS_JSON)
-        creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
-    else:
-        creds = Credentials.from_service_account_file('credentials.json', scopes=SCOPES)
-    return gspread.authorize(creds)
+    global sheets_client
+    if sheets_client is None:
+        if CREDENTIALS_JSON:
+            creds_dict = json.loads(CREDENTIALS_JSON)
+            creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+        else:
+            creds = Credentials.from_service_account_file('credentials.json', scopes=SCOPES)
+        sheets_client = gspread.authorize(creds)
+    return sheets_client
 
-# スプレッドシートの初期化
-def initialize_sheet():
+# スプレッドシートの初期化(同期関数)
+def initialize_sheet_sync():
+    global spreadsheet, sheet
     try:
         client = get_google_sheets_client()
         spreadsheet = client.open_by_key(SPREADSHEET_ID)
@@ -48,17 +53,18 @@ def initialize_sheet():
             sheet.update([headers], 'A1:F1')
         
         print("✅ スプレッドシート初期化完了")
-        return sheet
+        return True
     except Exception as e:
         print(f"❌ スプレッドシート初期化エラー: {e}")
-        return None
+        return False
 
-# ログをスプレッドシートに追加
+# ログをスプレッドシートに追加(入室時)
 def log_to_sheet(date, name, user_id, channel_name, join_time, leave_time=""):
     try:
-        client = get_google_sheets_client()
-        spreadsheet = client.open_by_key(SPREADSHEET_ID)
-        sheet = spreadsheet.worksheet(SHEET_NAME)
+        global sheet
+        if sheet is None:
+            print("⚠️ スプレッドシート未初期化")
+            return
         
         row = [date, name, str(user_id), channel_name, join_time, leave_time]
         sheet.append_row(row, value_input_option='USER_ENTERED')
@@ -70,19 +76,21 @@ def log_to_sheet(date, name, user_id, channel_name, join_time, leave_time=""):
 # 退出時間を既存の行に更新
 def update_leave_time(user_id, channel_name, leave_time):
     try:
-        client = get_google_sheets_client()
-        spreadsheet = client.open_by_key(SPREADSHEET_ID)
-        sheet = spreadsheet.worksheet(SHEET_NAME)
+        global sheet
+        if sheet is None:
+            print("⚠️ スプレッドシート未初期化")
+            return False
         
         all_values = sheet.get_all_values()
         
         for i in range(len(all_values) - 1, 0, -1):
             row = all_values[i]
-            if len(row) >= 6:
-                if row[2] == str(user_id) and row[3] == channel_name and (len(row) < 6 or row[5] == ""):
-                    sheet.update_cell(i + 1, 6, leave_time)
-                    print(f"📝 退出記録: {row[1]} - {channel_name} ({leave_time})")
-                    return True
+            if len(row) >= 3:
+                if row[2] == str(user_id) and row[3] == channel_name:
+                    if len(row) < 6 or row[5] == "":
+                        sheet.update_cell(i + 1, 6, leave_time)
+                        print(f"📝 退出記録: {row[1]} - {channel_name} ({leave_time})")
+                        return True
         
         print(f"⚠️ 入室記録が見つかりません: UserID={user_id}, Channel={channel_name}")
         return False
@@ -91,8 +99,7 @@ def update_leave_time(user_id, channel_name, leave_time):
         print(f"❌ 退出時間更新エラー: {e}")
         return False
 
-user_join_times = {}
-
+# Discord Bot の設定
 intents = discord.Intents.default()
 intents.voice_states = True
 intents.guilds = True
@@ -102,57 +109,103 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 
 @bot.event
 async def on_ready():
+    """Bot起動時の処理(軽量化版)"""
     print(f'✅ {bot.user} としてログインしました')
-    print('👀 ボイスチャンネルの監視を開始します...')
     print(f'🕐 現在の日本時間: {datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")}')
+    print('👀 ボイスチャンネルの監視を開始します...')
     
-    # スプレッドシートの初期化を別スレッドで実行
+    # スプレッドシート初期化を別スレッドで実行
+    if not sheet_init_task.is_running():
+        sheet_init_task.start()
+
+@tasks.loop(count=1)
+async def sheet_init_task():
+    """スプレッドシート初期化タスク(一度だけ実行)"""
+    await asyncio.sleep(2)  # Bot起動を待つ
     loop = asyncio.get_event_loop()
-    await loop.run_in_executor(executor, initialize_sheet)
+    success = await loop.run_in_executor(None, initialize_sheet_sync)
+    if success:
+        print("📊 スプレッドシートの記録準備完了")
+    else:
+        print("❌ スプレッドシート初期化に失敗しました")
 
 @bot.event
 async def on_voice_state_update(member, before, after):
+    """ボイスチャンネルの入退室を検知"""
+    
+    # スプレッドシート未初期化の場合はスキップ
+    if sheet is None:
+        print("⏳ スプレッドシート初期化待機中...")
+        return
+    
     now = datetime.now(JST)
     date = now.strftime('%Y-%m-%d')
     time_str = now.strftime('%H:%M:%S')
     
-    # 非同期で実行するためのラッパー
     loop = asyncio.get_event_loop()
     
+    # 入室検知
     if before.channel is None and after.channel is not None:
-        key = f"{member.id}_{after.channel.id}"
-        user_join_times[key] = time_str
-        print(f"🟢 入室: {member.name} → {after.channel.name} ({time_str})")
+        print(f"🟢 入室: {member.display_name} → {after.channel.name} ({time_str})")
         
-        # 別スレッドで実行
-        loop.run_in_executor(executor, log_to_sheet, date, member.name, member.id, after.channel.name, time_str, "")
+        await loop.run_in_executor(
+            None,
+            log_to_sheet,
+            date,
+            member.display_name,
+            member.id,
+            after.channel.name,
+            time_str,
+            ""
+        )
     
+    # 退出検知
     elif before.channel is not None and after.channel is None:
-        key = f"{member.id}_{before.channel.id}"
-        print(f"🔴 退出: {member.name} ← {before.channel.name} ({time_str})")
+        print(f"🔴 退出: {member.display_name} ← {before.channel.name} ({time_str})")
         
-        # 別スレッドで実行
-        loop.run_in_executor(executor, update_leave_time, member.id, before.channel.name, time_str)
-        
-        if key in user_join_times:
-            del user_join_times[key]
+        await loop.run_in_executor(
+            None,
+            update_leave_time,
+            member.id,
+            before.channel.name,
+            time_str
+        )
     
+    # チャンネル移動検知
     elif before.channel is not None and after.channel is not None and before.channel != after.channel:
-        key_before = f"{member.id}_{before.channel.id}"
-        print(f"🔄 移動: {member.name} {before.channel.name} → {after.channel.name}")
+        print(f"🔄 移動: {member.display_name} {before.channel.name} → {after.channel.name}")
         
-        # 別スレッドで実行
-        loop.run_in_executor(executor, update_leave_time, member.id, before.channel.name, time_str)
+        # 前のチャンネルの退出時間を更新
+        await loop.run_in_executor(
+            None,
+            update_leave_time,
+            member.id,
+            before.channel.name,
+            time_str
+        )
         
-        if key_before in user_join_times:
-            del user_join_times[key_before]
-        
-        key_after = f"{member.id}_{after.channel.id}"
-        user_join_times[key_after] = time_str
-        
-        # 別スレッドで実行
-        loop.run_in_executor(executor, log_to_sheet, date, member.name, member.id, after.channel.name, time_str, "")
+        # 新しいチャンネルへの入室を記録
+        await loop.run_in_executor(
+            None,
+            log_to_sheet,
+            date,
+            member.display_name,
+            member.id,
+            after.channel.name,
+            time_str,
+            ""
+        )
 
+# 定期的な稼働確認ログ(Render.comのスリープ防止)
+@tasks.loop(minutes=5)
+async def keep_alive():
+    print(f"💓 稼働中... {datetime.now(JST).strftime('%H:%M:%S')}")
+
+@keep_alive.before_loop
+async def before_keep_alive():
+    await bot.wait_until_ready()
+
+# Bot を起動
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
         print("❌ DISCORD_TOKEN が設定されていません")
@@ -161,6 +214,7 @@ if __name__ == "__main__":
     else:
         try:
             print("🚀 Bot を起動しています...")
+            keep_alive.start()  # 稼働確認ログを開始
             bot.run(DISCORD_TOKEN)
         except Exception as e:
             print(f"❌ Bot起動エラー: {e}")
