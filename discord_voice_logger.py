@@ -5,6 +5,7 @@ from google.oauth2.service_account import Credentials
 from datetime import datetime, timezone, timedelta
 import os
 import json
+import time
 
 # 環境変数から設定を取得
 SPREADSHEET_ID = os.environ.get('SPREADSHEET_ID')
@@ -15,17 +16,15 @@ CREDENTIALS_JSON = os.environ.get('CREDENTIALS_JSON')
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
 SHEET_NAME = 'ボイスログ'
 
-# 日本時間（JST）のタイムゾーン設定
+# 日本時間(JST)のタイムゾーン設定
 JST = timezone(timedelta(hours=9))
 
-# Google Sheets 認証（環境変数から）
+# Google Sheets 認証(環境変数から)
 def get_google_sheets_client():
     if CREDENTIALS_JSON:
-        # 環境変数からJSON文字列を読み込み
         creds_dict = json.loads(CREDENTIALS_JSON)
         creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
     else:
-        # ローカルファイルから読み込み（開発時用）
         creds = Credentials.from_service_account_file('credentials.json', scopes=SCOPES)
     return gspread.authorize(creds)
 
@@ -35,13 +34,11 @@ def initialize_sheet():
         client = get_google_sheets_client()
         spreadsheet = client.open_by_key(SPREADSHEET_ID)
         
-        # シートが存在するか確認、なければ作成
         try:
             sheet = spreadsheet.worksheet(SHEET_NAME)
         except gspread.WorksheetNotFound:
             sheet = spreadsheet.add_worksheet(title=SHEET_NAME, rows=1000, cols=6)
         
-        # ヘッダー行を設定
         headers = ['日付', '名前', 'ID', '部屋の名前', '入室時間', '退出時間']
         if sheet.row_values(1) != headers:
             sheet.update([headers], 'A1:F1')
@@ -52,48 +49,102 @@ def initialize_sheet():
         print(f"❌ スプレッドシート初期化エラー: {e}")
         return None
 
-# ログをスプレッドシートに追加（入室時のみ使用）
+# Google Sheets APIへのリトライ付きアクセス
+def retry_sheets_operation(operation, max_retries=3, delay=1):
+    """Google Sheets操作を失敗時にリトライする"""
+    for attempt in range(max_retries):
+        try:
+            return operation()
+        except Exception as e:
+            if attempt < max_retries - 1:
+                print(f"⚠️ Google Sheets API エラー(リトライ {attempt + 1}/{max_retries}): {e}")
+                time.sleep(delay)
+            else:
+                print(f"❌ Google Sheets API エラー(最終試行失敗): {e}")
+                raise
+
+# ログをスプレッドシートに追加(入室時のみ使用)
 def log_to_sheet(date, name, user_id, channel_name, join_time, leave_time=""):
     try:
-        client = get_google_sheets_client()
-        spreadsheet = client.open_by_key(SPREADSHEET_ID)
-        sheet = spreadsheet.worksheet(SHEET_NAME)
+        print(f"📊 [DEBUG] log_to_sheet開始: {name} (ID:{user_id}) - {channel_name}")
         
-        # 新しい行を追加
-        row = [date, name, str(user_id), channel_name, join_time, leave_time]
-        sheet.append_row(row, value_input_option='USER_ENTERED')
-        print(f"📝 入室記録: {name} - {channel_name} ({join_time})")
+        def add_row():
+            client = get_google_sheets_client()
+            spreadsheet = client.open_by_key(SPREADSHEET_ID)
+            sheet = spreadsheet.worksheet(SHEET_NAME)
+            row = [date, name, str(user_id), channel_name, join_time, leave_time]
+            sheet.append_row(row, value_input_option='USER_ENTERED')
+            return True
+        
+        retry_sheets_operation(add_row)
+        print(f"✅ 入室記録成功: {name} - {channel_name} ({join_time})")
         
     except Exception as e:
         print(f"❌ スプレッドシート書き込みエラー: {e}")
+        print(f"   データ: date={date}, name={name}, user_id={user_id}, channel={channel_name}")
 
 # 退出時間を既存の行に更新
-def update_leave_time(user_id, channel_name, leave_time):
+def update_leave_time(user_id, channel_name, leave_time, display_name="不明"):
     try:
-        client = get_google_sheets_client()
-        spreadsheet = client.open_by_key(SPREADSHEET_ID)
-        sheet = spreadsheet.worksheet(SHEET_NAME)
+        print(f"📊 [DEBUG] update_leave_time開始: {display_name} (ID:{user_id}) - {channel_name}")
         
-        # 全データを取得
-        all_values = sheet.get_all_values()
-        
-        # 最後の行から遡って、該当ユーザーの入室記録を探す
-        for i in range(len(all_values) - 1, 0, -1):  # 最後の行から検索（0行目はヘッダー）
-            row = all_values[i]
-            # C列（index 2）がID、D列（index 3）が部屋名、F列（index 5）が退出時間
-            if len(row) >= 6:
+        def update_operation():
+            client = get_google_sheets_client()
+            spreadsheet = client.open_by_key(SPREADSHEET_ID)
+            sheet = spreadsheet.worksheet(SHEET_NAME)
+            
+            # 全データを取得
+            all_values = sheet.get_all_values()
+            print(f"📊 [DEBUG] 取得した行数: {len(all_values)}")
+            
+            # 最後の行から遡って、該当ユーザーの入室記録を探す
+            for i in range(len(all_values) - 1, 0, -1):
+                row = all_values[i]
+                
+                # 安全に列データを取得
+                row_id = row[2] if len(row) > 2 else ""
+                row_channel = row[3] if len(row) > 3 else ""
+                row_leave_time = row[5] if len(row) > 5 else ""
+                
+                print(f"📊 [DEBUG] 行{i+1}をチェック: ID={row_id}, Channel={row_channel}, Leave={row_leave_time}")
+                
                 # IDと部屋名が一致し、退出時間が空欄の行を探す
-                if row[2] == str(user_id) and row[3] == channel_name and (len(row) < 6 or row[5] == ""):
-                    # F列（6列目）に退出時間を更新
+                if row_id == str(user_id) and row_channel == channel_name and row_leave_time == "":
+                    print(f"📊 [DEBUG] 一致する行を発見: 行{i+1}")
                     sheet.update_cell(i + 1, 6, leave_time)
-                    print(f"📝 退出記録: {row[1]} - {channel_name} ({leave_time})")
+                    row_name = row[1] if len(row) > 1 else "不明"
+                    print(f"✅ 退出記録成功: {row_name} - {channel_name} ({leave_time})")
                     return True
+            
+            print(f"⚠️ 入室記録が見つかりません: UserID={user_id}, Channel={channel_name}")
+            return False
         
-        print(f"⚠️ 入室記録が見つかりません: UserID={user_id}, Channel={channel_name}")
-        return False
+        result = retry_sheets_operation(update_operation)
+        
+        # フォールバック: 入室記録が見つからない場合、新しい行を作成
+        if not result:
+            print(f"⚠️ フォールバック処理: 新しい行として記録します")
+            now = datetime.now(JST)
+            date = now.strftime('%Y-%m-%d')
+            # 入室時間を「不明」として記録
+            log_to_sheet(date, display_name, user_id, channel_name, "不明", leave_time)
+            return True
+        
+        return result
         
     except Exception as e:
         print(f"❌ 退出時間更新エラー: {e}")
+        print(f"   データ: user_id={user_id}, channel={channel_name}, leave_time={leave_time}")
+        
+        # エラー時もフォールバック処理を試みる
+        try:
+            print(f"⚠️ エラー後のフォールバック処理を実行")
+            now = datetime.now(JST)
+            date = now.strftime('%Y-%m-%d')
+            log_to_sheet(date, display_name, user_id, channel_name, "不明", leave_time)
+        except:
+            pass
+        
         return False
 
 # 入室時間を記録する辞書
@@ -120,75 +171,89 @@ async def on_ready():
 async def on_voice_state_update(member, before, after):
     """ボイスチャンネルの入退室を検知"""
     
-    # 日本時間を取得
-    now = datetime.now(JST)
-    date = now.strftime('%Y-%m-%d')
-    time_str = now.strftime('%H:%M:%S')
-    
-    # 入室検知
-    if before.channel is None and after.channel is not None:
-        # 入室時間を記録
-        key = f"{member.id}_{after.channel.id}"
-        user_join_times[key] = time_str
+    try:
+        # 日本時間を取得
+        now = datetime.now(JST)
+        date = now.strftime('%Y-%m-%d')
+        time_str = now.strftime('%H:%M:%S')
         
-        print(f"🟢 入室: {member.name} → {after.channel.name} ({time_str})")
+        print(f"\n{'='*60}")
+        print(f"🎯 [イベント検知] {member.display_name} (ID:{member.id})")
+        print(f"   Before: {before.channel.name if before.channel else 'None'}")
+        print(f"   After: {after.channel.name if after.channel else 'None'}")
+        print(f"   時刻: {time_str}")
+        print(f"{'='*60}\n")
         
-        # スプレッドシートに記録（退出時間は空欄）
-        log_to_sheet(
-            date=date,
-            name=member.name,
-            user_id=member.id,
-            channel_name=after.channel.name,
-            join_time=time_str,
-            leave_time=""
-        )
-    
-    # 退出検知
-    elif before.channel is not None and after.channel is None:
-        key = f"{member.id}_{before.channel.id}"
+        # 入室検知
+        if before.channel is None and after.channel is not None:
+            key = f"{member.id}_{after.channel.id}"
+            user_join_times[key] = time_str
+            
+            print(f"🟢 [入室] {member.display_name} → {after.channel.name} ({time_str})")
+            
+            log_to_sheet(
+                date=date,
+                name=member.display_name,
+                user_id=member.id,
+                channel_name=after.channel.name,
+                join_time=time_str,
+                leave_time=""
+            )
         
-        print(f"🔴 退出: {member.name} ← {before.channel.name} ({time_str})")
+        # 退出検知
+        elif before.channel is not None and after.channel is None:
+            key = f"{member.id}_{before.channel.id}"
+            
+            print(f"🔴 [退出] {member.display_name} ← {before.channel.name} ({time_str})")
+            
+            update_leave_time(
+                user_id=member.id,
+                channel_name=before.channel.name,
+                leave_time=time_str,
+                display_name=member.display_name
+            )
+            
+            if key in user_join_times:
+                del user_join_times[key]
         
-        # 既存の行に退出時間を更新
-        update_leave_time(
-            user_id=member.id,
-            channel_name=before.channel.name,
-            leave_time=time_str
-        )
+        # チャンネル移動検知
+        elif before.channel is not None and after.channel is not None and before.channel != after.channel:
+            key_before = f"{member.id}_{before.channel.id}"
+            
+            print(f"🔄 [移動] {member.display_name}: {before.channel.name} → {after.channel.name} ({time_str})")
+            
+            # ステップ1: 前のチャンネルの退出時間を更新
+            print(f"   ステップ1: {before.channel.name} の退出時刻を記録")
+            update_leave_time(
+                user_id=member.id,
+                channel_name=before.channel.name,
+                leave_time=time_str,
+                display_name=member.display_name
+            )
+            
+            if key_before in user_join_times:
+                del user_join_times[key_before]
+            
+            # ステップ2: 新しいチャンネルへの入室を記録
+            print(f"   ステップ2: {after.channel.name} への入室を記録")
+            key_after = f"{member.id}_{after.channel.id}"
+            user_join_times[key_after] = time_str
+            
+            log_to_sheet(
+                date=date,
+                name=member.display_name,
+                user_id=member.id,
+                channel_name=after.channel.name,
+                join_time=time_str,
+                leave_time=""
+            )
+            
+            print(f"✅ [移動完了] 両方の記録が完了しました")
         
-        # 記録を削除
-        if key in user_join_times:
-            del user_join_times[key]
-    
-    # チャンネル移動検知
-    elif before.channel is not None and after.channel is not None and before.channel != after.channel:
-        # 前のチャンネルから退出
-        key_before = f"{member.id}_{before.channel.id}"
-        
-        print(f"🔄 移動: {member.name} {before.channel.name} → {after.channel.name}")
-        
-        # 前のチャンネルの退出時間を更新
-        update_leave_time(
-            user_id=member.id,
-            channel_name=before.channel.name,
-            leave_time=time_str
-        )
-        
-        if key_before in user_join_times:
-            del user_join_times[key_before]
-        
-        # 新しいチャンネルへの入室を記録
-        key_after = f"{member.id}_{after.channel.id}"
-        user_join_times[key_after] = time_str
-        
-        log_to_sheet(
-            date=date,
-            name=member.name,
-            user_id=member.id,
-            channel_name=after.channel.name,
-            join_time=time_str,
-            leave_time=""
-        )
+    except Exception as e:
+        print(f"❌ on_voice_state_update内でエラー発生: {e}")
+        import traceback
+        traceback.print_exc()
 
 # Bot を起動
 if __name__ == "__main__":
