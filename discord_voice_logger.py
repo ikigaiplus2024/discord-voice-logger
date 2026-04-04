@@ -1,4 +1,4 @@
-import discord
+  import discord
   from discord.ext import commands
   import gspread
   from google.oauth2.service_account import Credentials
@@ -30,9 +30,9 @@ import discord
           row = await write_queue.get()
           try:
               await asyncio.to_thread(append_to_sheet, row)
-              print(f'✅ 書き込み成功: {row}')
+              print(f'書き込み成功: {row}')
           except Exception as e:
-              print(f'❌ 書き込みエラー: {e} | データ: {row}')
+              print(f'書き込みエラー: {e} | データ: {row}')
           finally:
               write_queue.task_done()
 
@@ -43,8 +43,8 @@ import discord
 
   @bot.event
   async def on_ready():
-      print(f'✅ {bot.user} としてログイン完了')
-      print(f'🕐 {datetime.now(JST).strftime("%Y/%m/%d %H:%M:%S")}')
+      print(f'{bot.user} としてログイン完了')
+      print(f'{datetime.now(JST).strftime("%Y/%m/%d %H:%M:%S")}')
       asyncio.create_task(sheet_writer())
 
   @bot.event
@@ -72,6 +72,6 @@ import discord
 
       row = [date_str, time_str, username, event, room1, room2]
       await write_queue.put(row)
-      print(f'📥 {event}: {username} ({room1}{"→"+room2 if room2 else ""})')
+      print(f'{event}: {username} ({room1}{"->"+room2 if room2 else ""})')
 
   bot.run(DISCORD_TOKEN)
